@@ -248,41 +248,90 @@ pub(crate) fn account_emails() -> Result<BTreeMap<String, String>, AppError> {
     Ok(emails)
 }
 
-/// macOS Keychain access through the native Security framework (#4850: the `security -i`
-/// subprocess split large values into several commands and echoed them in its errors).
-/// Errors carry only the operation and the OSStatus, never the item data.
+/// macOS Keychain access through `/usr/bin/security` with plain argv (#4850). Claude Code
+/// creates and rewrites the item with this tool, so the item's access list trusts only it:
+/// native Security framework calls from CC Switch prompt on every access. `security -i` is not
+/// used either: its ~4 KB line limit split large values into several commands.
+/// Errors carry only the operation and the exit code, never argv, output or item data.
 #[cfg(target_os = "macos")]
 pub(crate) mod keychain {
-    use security_framework::passwords::{
-        delete_generic_password, get_generic_password, set_generic_password,
-    };
+    use std::process::{Command, Output};
 
     use crate::error::AppError;
 
     pub const SERVICE: &str = "Claude Code-credentials";
-    /// `errSecItemNotFound`.
-    const ITEM_NOT_FOUND: i32 = -25300;
+    /// `security` exit code for "item not found".
+    const NOT_FOUND: i32 = 44;
 
     /// The item's data; `None` when there is no item.
     pub fn read() -> Result<Option<Vec<u8>>, AppError> {
-        match get_generic_password(SERVICE, &account()?) {
-            Ok(data) => Ok(Some(data)),
-            Err(err) if err.code() == ITEM_NOT_FOUND => Ok(None),
-            Err(err) => Err(failed("read", err.code())),
+        let output = run(
+            "read",
+            &[
+                "find-generic-password",
+                "-a",
+                &account()?,
+                "-s",
+                SERVICE,
+                "-w",
+            ],
+        )?;
+        if output.status.code() == Some(NOT_FOUND) {
+            return Ok(None);
         }
+        check("read", &output)?;
+        Ok(Some(decode_printed(output.stdout)))
     }
 
-    /// Create or replace the item's data.
+    /// Create or replace the item's data. Accepted trade-off (same as Claude Code): the hex
+    /// is briefly visible in this user's process list while `security` runs; never logged.
     pub fn write(data: &[u8]) -> Result<(), AppError> {
-        set_generic_password(SERVICE, &account()?, data).map_err(|err| failed("write", err.code()))
+        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+        let output = run(
+            "write",
+            &[
+                "add-generic-password",
+                "-U",
+                "-a",
+                &account()?,
+                "-s",
+                SERVICE,
+                "-X",
+                &hex,
+            ],
+        )?;
+        check("write", &output)
     }
 
     /// Delete the item; a missing item is not an error.
     pub fn delete() -> Result<(), AppError> {
-        match delete_generic_password(SERVICE, &account()?) {
-            Err(err) if err.code() != ITEM_NOT_FOUND => Err(failed("delete", err.code())),
-            _ => Ok(()),
+        let output = run(
+            "delete",
+            &["delete-generic-password", "-a", &account()?, "-s", SERVICE],
+        )?;
+        if output.status.code() == Some(NOT_FOUND) {
+            return Ok(());
         }
+        check("delete", &output)
+    }
+
+    /// `-w` prints the data as-is, or as hex when it is not printable (multi-line, non-UTF-8).
+    pub(super) fn decode_printed(mut stdout: Vec<u8>) -> Vec<u8> {
+        while stdout.last().is_some_and(u8::is_ascii_whitespace) {
+            stdout.pop();
+        }
+        let is_hex =
+            !stdout.is_empty() && stdout.len() % 2 == 0 && stdout.iter().all(u8::is_ascii_hexdigit);
+        if !is_hex || serde_json::from_slice::<serde_json::Value>(&stdout).is_ok() {
+            return stdout;
+        }
+        stdout
+            .chunks(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).expect("ASCII hex digits");
+                u8::from_str_radix(text, 16).expect("hex digits")
+            })
+            .collect()
     }
 
     /// Claude Code names the item's account after the login user.
@@ -295,9 +344,24 @@ pub(crate) mod keychain {
             })
     }
 
-    pub(super) fn failed(operation: &str, status: i32) -> AppError {
+    fn run(operation: &str, args: &[&str]) -> Result<Output, AppError> {
+        Command::new("/usr/bin/security")
+            .args(args)
+            .output()
+            .map_err(|_| failed(operation, None))
+    }
+
+    fn check(operation: &str, output: &Output) -> Result<(), AppError> {
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(failed(operation, output.status.code()))
+    }
+
+    pub(super) fn failed(operation: &str, code: Option<i32>) -> AppError {
+        let code = code.map_or_else(|| "none".to_string(), |code| code.to_string());
         AppError::Message(format!(
-            "Keychain {operation} of the Claude Code login failed (OSStatus {status})"
+            "Keychain {operation} of the Claude Code login failed (security exit code {code})"
         ))
     }
 }
@@ -513,9 +577,31 @@ mod tests {
     #[test]
     fn keychain_errors_carry_only_the_operation_and_status() {
         assert_eq!(
-            keychain::failed("write", -25293).to_string(),
-            "Keychain write of the Claude Code login failed (OSStatus -25293)"
+            keychain::failed("write", Some(45)).to_string(),
+            "Keychain write of the Claude Code login failed (security exit code 45)"
         );
+        assert_eq!(
+            keychain::failed("read", None).to_string(),
+            "Keychain read of the Claude Code login failed (security exit code none)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_output_printed_as_hex_is_decoded() {
+        let data = b"{\n  \"claudeAiOauth\": {}\n}".to_vec();
+        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            keychain::decode_printed(format!("{hex}\n").into_bytes()),
+            data
+        );
+        let plain = br#"{"claudeAiOauth":{}}"#.to_vec();
+        assert_eq!(
+            keychain::decode_printed([plain.clone(), b"\n".to_vec()].concat()),
+            plain
+        );
+        // Valid JSON made only of hex digits (a number) stays as printed.
+        assert_eq!(keychain::decode_printed(b"12".to_vec()), b"12".to_vec());
     }
 
     #[test]

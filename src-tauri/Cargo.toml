@@ -105,8 +105,6 @@ rquickjs = { version = "0.8", features = ["bindgen"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-# #4850: native Keychain access for Claude Code logins (same version as already in Cargo.lock)
-security-framework = "=3.7.0"
 objc2-app-kit = { version = "0.2", features = ["NSColor"] }
 
 # Optimize release binary size to help reduce AppImage footprint
