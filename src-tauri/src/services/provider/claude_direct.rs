@@ -109,7 +109,7 @@ fn switch_with_login(
     let (store, credentials_pre) = CredentialStore::detect()?;
     let claude_json_path = get_claude_mcp_path();
     let claude_json_pre = read_current(&claude_json_path)?;
-    let credentials = json::parse(Path::new(".credentials.json"), credentials_pre.as_deref())?.0;
+    let credentials = claude_login::parse_credentials(credentials_pre.as_deref())?;
     let claude_json = json::parse(&claude_json_path, claude_json_pre.as_deref())?.0;
     let live = claude_login::live_login(&credentials, &claude_json);
 
@@ -154,15 +154,17 @@ fn switch_with_login(
         }),
         #[cfg(target_os = "macos")]
         (CredentialStore::Keychain, Some(patch)) => {
-            // Compact JSON: `security -w` prints multi-line data as hex, which Claude Code
-            // would not parse.
+            // Compact single-line JSON, the way Claude Code stores it.
             let mut next = credentials.clone();
             patch.apply_to(Path::new(".credentials.json"), &mut next)?;
             if next != credentials {
-                let bytes = serde_json::to_vec(&next).map_err(|e| {
-                    AppError::Message(format!("Failed to serialize credentials: {e}"))
+                let bytes = serde_json::to_vec(&next).map_err(|_| {
+                    AppError::Message("Failed to serialize the Claude Code login".into())
                 })?;
-                claude_login::keychain::write(&bytes)?;
+                // #4850: a failed write may still have changed the item; put the old one back.
+                if let Err(err) = claude_login::keychain::write(&bytes) {
+                    return Err(restore_keychain(credentials_pre.as_deref(), err));
+                }
                 keychain_pre = Some(credentials_pre.clone());
             }
         }
@@ -186,24 +188,35 @@ fn switch_with_login(
         &changes,
         PendingTarget::pointer(Some(target.id.clone())),
     );
+    let err = match result {
+        Ok(report) => return Ok(report),
+        Err(err) => err,
+    };
     // Dropped before publishing (nothing pending to roll forward): put the Keychain back.
     #[cfg(target_os = "macos")]
     {
-        if let (Err(err), Some(pre)) = (&result, keychain_pre) {
+        if let Some(pre) = keychain_pre {
             if matches!(crate::mode::state::pending(&write.store, app()), Ok(None)) {
-                let restored = match pre {
-                    Some(bytes) => claude_login::keychain::write(&bytes),
-                    None => claude_login::keychain::delete(),
-                };
-                if let Err(restore_err) = restored {
-                    return Err(AppError::Message(format!(
-                        "{err}; additionally failed to restore the Claude Code login in the Keychain: {restore_err}"
-                    )));
-                }
+                return Err(restore_keychain(pre.as_deref(), err));
             }
         }
     }
-    result
+    Err(err)
+}
+
+/// #4850: put the previous Keychain data back after `cause`. Messages never carry item data.
+#[cfg(target_os = "macos")]
+fn restore_keychain(pre: Option<&[u8]>, cause: AppError) -> AppError {
+    let restored = match pre {
+        Some(bytes) => claude_login::keychain::write(bytes),
+        None => claude_login::keychain::delete(),
+    };
+    match restored {
+        Ok(()) => cause,
+        Err(restore_err) => AppError::Message(format!(
+            "{cause}. Restoring the previous Claude Code login also failed ({restore_err}), so the Keychain item may be inconsistent; run `claude /login` if Claude Code reports a problem"
+        )),
+    }
 }
 
 /// 把当前供应商 `target` 重新投影到 live，不改指针。`prev` 是 live 现在对应的那一版

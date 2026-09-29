@@ -183,10 +183,41 @@ pub(crate) fn parse_stash(
     // A broken stash may still hold logins: stop instead of overwriting it.
     serde_json::from_slice(bytes).map_err(|err| {
         AppError::Message(format!(
-            "The Claude login stash {} cannot be parsed ({err}). Repair or move the file away and try again. Nothing was written",
-            path.display()
+            "The Claude login stash {} cannot be parsed ({}). Repair or move the file away and try again. Nothing was written",
+            path.display(),
+            json_error_position(&err)
         ))
     })
+}
+
+/// The live credential JSON (Keychain data or `.credentials.json`); missing is `{}`.
+pub(crate) fn parse_credentials(bytes: Option<&[u8]>) -> Result<Value, AppError> {
+    let Some(bytes) = bytes else {
+        return Ok(Value::Object(serde_json::Map::new()));
+    };
+    let value: Value = serde_json::from_slice(bytes).map_err(|err| {
+        AppError::Message(format!(
+            "The Claude Code login cannot be parsed ({}). Nothing was written",
+            json_error_position(&err)
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(AppError::Message(
+            "The Claude Code login is not a JSON object. Nothing was written".into(),
+        ));
+    }
+    Ok(value)
+}
+
+/// #4850: serde messages can quote the offending value (a token), so errors only carry the
+/// error kind and position.
+fn json_error_position(err: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {}, column {}",
+        err.classify(),
+        err.line(),
+        err.column()
+    )
 }
 
 /// Email of each official card's login (card id → email), for the provider cards. The active
@@ -217,92 +248,57 @@ pub(crate) fn account_emails() -> Result<BTreeMap<String, String>, AppError> {
     Ok(emails)
 }
 
-/// macOS Keychain access through `/usr/bin/security`, the same tool Claude Code uses, so
-/// the item's access list already trusts it and no prompt appears.
+/// macOS Keychain access through the native Security framework (#4850: the `security -i`
+/// subprocess split large values into several commands and echoed them in its errors).
+/// Errors carry only the operation and the OSStatus, never the item data.
 #[cfg(target_os = "macos")]
 pub(crate) mod keychain {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+    };
 
     use crate::error::AppError;
 
     pub const SERVICE: &str = "Claude Code-credentials";
-    /// `security` exit code for "item not found".
-    const NOT_FOUND: i32 = 44;
+    /// `errSecItemNotFound`.
+    const ITEM_NOT_FOUND: i32 = -25300;
 
     /// The item's data; `None` when there is no item.
     pub fn read() -> Result<Option<Vec<u8>>, AppError> {
-        let output = Command::new("security")
-            .args(["find-generic-password", "-s", SERVICE, "-w"])
-            .output()
-            .map_err(|e| AppError::Message(format!("Failed to run security: {e}")))?;
-        if output.status.code() == Some(NOT_FOUND) {
-            return Ok(None);
+        match get_generic_password(SERVICE, &account()?) {
+            Ok(data) => Ok(Some(data)),
+            Err(err) if err.code() == ITEM_NOT_FOUND => Ok(None),
+            Err(err) => Err(failed("read", err.code())),
         }
-        if !output.status.success() {
-            return Err(AppError::Message(format!(
-                "Failed to read the Claude Code login from the Keychain: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        let mut data = output.stdout;
-        while data.last().is_some_and(u8::is_ascii_whitespace) {
-            data.pop();
-        }
-        Ok(Some(data))
     }
 
-    /// Create or replace the item. The data goes through stdin (`security -i`), hex-encoded,
-    /// so tokens never appear in process arguments.
+    /// Create or replace the item's data.
     pub fn write(data: &[u8]) -> Result<(), AppError> {
-        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
-        run_interactive(&format!(
-            "add-generic-password -U -a \"{}\" -s \"{SERVICE}\" -X \"{hex}\"\n",
-            account()?
-        ))
+        set_generic_password(SERVICE, &account()?, data).map_err(|err| failed("write", err.code()))
     }
 
+    /// Delete the item; a missing item is not an error.
     pub fn delete() -> Result<(), AppError> {
-        run_interactive(&format!(
-            "delete-generic-password -a \"{}\" -s \"{SERVICE}\"\n",
-            account()?
-        ))
+        match delete_generic_password(SERVICE, &account()?) {
+            Err(err) if err.code() != ITEM_NOT_FOUND => Err(failed("delete", err.code())),
+            _ => Ok(()),
+        }
     }
 
     /// Claude Code names the item's account after the login user.
     fn account() -> Result<String, AppError> {
         std::env::var("USER")
             .ok()
-            .filter(|user| !user.is_empty() && !user.contains('"'))
+            .filter(|user| !user.is_empty())
             .ok_or_else(|| {
                 AppError::Message("USER is not set; cannot address the Keychain item".into())
             })
     }
 
-    fn run_interactive(command: &str) -> Result<(), AppError> {
-        let mut child = Command::new("security")
-            .arg("-i")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| AppError::Message(format!("Failed to run security: {e}")))?;
-        child
-            .stdin
-            .take()
-            .expect("stdin is piped")
-            .write_all(command.as_bytes())
-            .map_err(|e| AppError::Message(format!("Failed to talk to security: {e}")))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|e| AppError::Message(format!("Failed to run security: {e}")))?;
-        if !output.status.success() {
-            return Err(AppError::Message(format!(
-                "Failed to update the Claude Code login in the Keychain: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(())
+    pub(super) fn failed(operation: &str, status: i32) -> AppError {
+        AppError::Message(format!(
+            "Keychain {operation} of the Claude Code login failed (OSStatus {status})"
+        ))
     }
 }
 
@@ -494,6 +490,32 @@ mod tests {
 
         assert!(LiveAction::Keep.credentials_patch().is_none());
         assert!(LiveAction::Keep.account_patch().is_none());
+    }
+
+    #[test]
+    fn parse_errors_never_quote_the_data() {
+        let path = Path::new("stash.json");
+        let stash = br#"{"logins":{"a":"sk-ant-secret-token"}}"#;
+        let err = parse_stash(path, Some(stash)).unwrap_err().to_string();
+        assert!(!err.contains("sk-ant-secret-token"), "{err}");
+        let err = parse_credentials(Some(b"\"sk-ant-secret-token\""))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("sk-ant-secret-token"), "{err}");
+        let err = parse_credentials(Some(b"{\"claudeAiOauth\": sk-ant-secret-token}"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("sk-ant-secret-token"), "{err}");
+        assert_eq!(parse_credentials(None).unwrap(), json!({}));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_errors_carry_only_the_operation_and_status() {
+        assert_eq!(
+            keychain::failed("write", -25293).to_string(),
+            "Keychain write of the Claude Code login failed (OSStatus -25293)"
+        );
     }
 
     #[test]
