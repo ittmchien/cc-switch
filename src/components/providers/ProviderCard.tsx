@@ -13,7 +13,7 @@ import type {
 } from "@dnd-kit/core";
 import type { OpenClawProviderConfig, Provider } from "@/types";
 import type { AppId } from "@/lib/api";
-import { authApi } from "@/lib/api";
+import { authApi, providersApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ProviderActions } from "@/components/providers/ProviderActions";
 import { ProviderIcon } from "@/components/ProviderIcon";
@@ -218,6 +218,17 @@ export function ProviderCard({
       Boolean(managedCodexAccountId),
     staleTime: 30_000,
   });
+  // #4850: each Claude official card shows the account its saved login belongs to.
+  const isClaudeOfficial =
+    appId === "claude" && provider.category === "official";
+  const { data: claudeOfficialAccounts } = useQuery({
+    queryKey: ["providers", "claude", "official-accounts"],
+    queryFn: () => providersApi.getClaudeOfficialAccounts(),
+    enabled: isClaudeOfficial,
+  });
+  const claudeOfficialEmail = isClaudeOfficial
+    ? claudeOfficialAccounts?.[provider.id]
+    : undefined;
   const managedCodexAccount = codexAuthStatus?.accounts.find(
     (account) => account.id === managedCodexAccountId,
   );
@@ -602,6 +613,12 @@ export function ProviderCard({
                     })}
                   </span>
                 )}
+              </div>
+            ) : claudeOfficialEmail ? (
+              <div className="flex min-w-0 items-center text-sm text-muted-foreground">
+                <span className="min-w-0 truncate" title={claudeOfficialEmail}>
+                  {claudeOfficialEmail}
+                </span>
               </div>
             ) : displayUrl ? (
               <button

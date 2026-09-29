@@ -30,6 +30,13 @@ pub fn get_providers(
     ProviderService::list(state.inner(), app_type).map_err(|e| e.to_string())
 }
 
+/// #4850: email of each Claude official card's saved login (card id → email).
+#[tauri::command]
+pub fn get_claude_official_accounts() -> Result<std::collections::BTreeMap<String, String>, String>
+{
+    crate::services::provider::claude_login::account_emails().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<String, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;

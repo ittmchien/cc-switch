@@ -78,6 +78,11 @@ export const providersApi = {
     return await invoke("get_current_provider", { app: appId });
   },
 
+  // #4850: email of each Claude official card's saved login (card id → email).
+  async getClaudeOfficialAccounts(): Promise<Record<string, string>> {
+    return await invoke("get_claude_official_accounts");
+  },
+
   async add(
     provider: Provider,
     appId: AppId,

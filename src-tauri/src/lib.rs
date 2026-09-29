@@ -1374,6 +1374,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_providers,
+            commands::get_claude_official_accounts,
             commands::get_current_provider,
             commands::add_provider,
             commands::update_provider,

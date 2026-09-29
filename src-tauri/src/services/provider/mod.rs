@@ -4,6 +4,7 @@
 
 pub(crate) mod claude_direct;
 mod claude_editor;
+pub(crate) mod claude_login;
 pub(crate) mod codex_direct;
 mod codex_editor;
 mod codex_login;
@@ -1187,6 +1188,140 @@ mod tests {
             crate::settings::get_current_provider(&AppType::Claude).as_deref(),
             Some("b")
         );
+    }
+
+    /// #4850: each Claude official card keeps its own login. Switching saves the live
+    /// `claudeAiOauth` / `oauthAccount` under the card it belonged to and restores (or signs
+    /// out for) the target, leaving `mcpOAuth` and other `~/.claude.json` keys alone; a
+    /// third-party card in between does not touch the login.
+    #[tokio::test]
+    #[serial]
+    async fn claude_official_cards_swap_their_own_logins() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+        for id in ["official-a", "official-b"] {
+            let mut provider = Provider::with_id(id.into(), id.into(), json!({ "env": {} }), None);
+            provider.category = Some("official".to_string());
+            db.save_provider("claude", &provider)
+                .expect("save official");
+        }
+        let third_party = Provider::with_id(
+            "tp".into(),
+            "tp".into(),
+            json!({ "env": { "ANTHROPIC_BASE_URL": "https://tp.example", "ANTHROPIC_AUTH_TOKEN": "sk-tp" } }),
+            None,
+        );
+        db.save_provider("claude", &third_party)
+            .expect("save third party");
+
+        let creds_path = crate::config::get_claude_config_dir().join(".credentials.json");
+        let claude_json_path = crate::config::get_claude_mcp_path();
+        let mcp = json!({ "srv": { "accessToken": "mcp-token" } });
+        let sign_in = |who: &str| {
+            write_json_file(
+                &creds_path,
+                &json!({ "claudeAiOauth": { "accessToken": format!("access-{who}") }, "mcpOAuth": mcp }),
+            )
+            .expect("write credentials");
+            let mut root: Value = read_json_file(&claude_json_path).unwrap_or_else(|_| json!({}));
+            root["oauthAccount"] = json!({ "emailAddress": format!("{who}@example.com") });
+            root["numStartups"] = json!(7);
+            write_json_file(&claude_json_path, &root).expect("write claude.json");
+        };
+        let live = || {
+            let creds: Value = read_json_file(&creds_path).expect("read credentials");
+            let root: Value = read_json_file(&claude_json_path).expect("read claude.json");
+            assert_eq!(creds["mcpOAuth"], mcp, "MCP tokens are preserved");
+            assert_eq!(root["numStartups"], json!(7), "other keys are preserved");
+            (
+                creds.pointer("/claudeAiOauth/accessToken").cloned(),
+                root.pointer("/oauthAccount/emailAddress").cloned(),
+            )
+        };
+
+        ProviderService::switch(&state, AppType::Claude, "official-a").expect("switch to a");
+        sign_in("alice");
+
+        // B has no saved login yet: sign out so Claude Code asks to log in.
+        ProviderService::switch(&state, AppType::Claude, "official-b").expect("switch to b");
+        assert_eq!(live(), (None, None));
+        sign_in("bob");
+
+        ProviderService::switch(&state, AppType::Claude, "official-a").expect("back to a");
+        assert_eq!(
+            live(),
+            (
+                Some(json!("access-alice")),
+                Some(json!("alice@example.com"))
+            )
+        );
+
+        // Third party in between leaves the login alone.
+        ProviderService::switch(&state, AppType::Claude, "tp").expect("switch to tp");
+        assert_eq!(
+            live(),
+            (
+                Some(json!("access-alice")),
+                Some(json!("alice@example.com"))
+            )
+        );
+
+        ProviderService::switch(&state, AppType::Claude, "official-b").expect("tp to b");
+        assert_eq!(
+            live(),
+            (Some(json!("access-bob")), Some(json!("bob@example.com")))
+        );
+
+        let emails = super::claude_login::account_emails().expect("account emails");
+        assert_eq!(
+            emails.get("official-a").map(String::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            emails.get("official-b").map(String::as_str),
+            Some("bob@example.com")
+        );
+    }
+
+    /// #4850 backward compatibility: with no saved logins yet, third party → official keeps
+    /// the existing login instead of signing the user out.
+    #[tokio::test]
+    #[serial]
+    async fn claude_official_without_saved_login_adopts_the_existing_login() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+        let mut official = Provider::with_id(
+            "official".into(),
+            "official".into(),
+            json!({ "env": {} }),
+            None,
+        );
+        official.category = Some("official".to_string());
+        db.save_provider("claude", &official)
+            .expect("save official");
+        let third_party = Provider::with_id(
+            "tp".into(),
+            "tp".into(),
+            json!({ "env": { "ANTHROPIC_BASE_URL": "https://tp.example" } }),
+            None,
+        );
+        db.save_provider("claude", &third_party)
+            .expect("save third party");
+        ProviderService::switch(&state, AppType::Claude, "tp").expect("switch to tp");
+
+        let creds_path = crate::config::get_claude_config_dir().join(".credentials.json");
+        let creds = json!({ "claudeAiOauth": { "accessToken": "access-alice" } });
+        write_json_file(&creds_path, &creds).expect("write credentials");
+
+        ProviderService::switch(&state, AppType::Claude, "official").expect("switch to official");
+        let after: Value = read_json_file(&creds_path).expect("read credentials");
+        assert_eq!(after, creds);
     }
 
     /// A stale backup row must be refreshed but must not divert the live write.

@@ -130,21 +130,11 @@ fn read_claude_credentials() -> (Option<String>, CredentialStatus, Option<String
 #[cfg(target_os = "macos")]
 fn read_claude_credentials_from_keychain(
 ) -> Option<(Option<String>, CredentialStatus, Option<String>)> {
-    let output = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None; // Keychain 中无此条目，回退到文件
-    }
-
-    let json_str = String::from_utf8(output.stdout).ok()?;
+    // #4850: shared Keychain reader; any failure falls back to the credentials file.
+    let data = crate::services::provider::claude_login::keychain::read()
+        .ok()
+        .flatten()?;
+    let json_str = String::from_utf8(data).ok()?;
     let json_str = json_str.trim();
     if json_str.is_empty() {
         return None;
