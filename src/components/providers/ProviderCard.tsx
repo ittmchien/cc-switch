@@ -218,9 +218,12 @@ export function ProviderCard({
       Boolean(managedCodexAccountId),
     staleTime: 30_000,
   });
-  // #4850: each Claude official card shows the account its saved login belongs to.
+  // #4850: each Claude official card shows the account its saved login belongs to,
+  // unless the card has notes — notes keep priority, email only fills the empty slot.
   const isClaudeOfficial =
-    appId === "claude" && provider.category === "official";
+    appId === "claude" &&
+    provider.category === "official" &&
+    !provider.notes?.trim();
   const { data: claudeOfficialAccounts } = useQuery({
     queryKey: ["providers", "claude", "official-accounts"],
     queryFn: () => providersApi.getClaudeOfficialAccounts(),
