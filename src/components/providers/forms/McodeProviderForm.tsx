@@ -12,13 +12,13 @@ import { useProvidersQuery } from "@/lib/query/queries";
 import type { ProviderFormData } from "@/lib/schemas/provider";
 import type { OpenCodeModel, OpenCodeProviderOptions } from "@/types";
 import { mcodeProviderPresets } from "@/config/mcodeProviderPresets";
+import { mcodePresetModelSources } from "@/config/presetModelMetadata";
 import { BasicFormFields } from "./BasicFormFields";
 import { OpenCodeFormFields } from "./OpenCodeFormFields";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
 import { normalizeRequestHeaders } from "./helpers/requestHeaders";
 import {
-  isKnownOpencodeOptionKey,
-  OPENCODE_EXTRA_OPTION_DRAFT_PREFIX,
+  mergeOpencodeExtraOptionRows,
   toOpencodeExtraOptions,
 } from "./helpers/opencodeFormUtils";
 import type { ProviderFormProps } from "./ProviderForm";
@@ -169,7 +169,7 @@ export function McodeProviderForm({
     <Form {...form}>
       <form
         id="provider-form"
-        className="space-y-6 glass rounded-xl p-6 border border-white/10"
+        className="space-y-6"
         onSubmit={form.handleSubmit(async (identity) => {
           if (!ready || busy) return;
           setBusy(true);
@@ -251,7 +251,7 @@ export function McodeProviderForm({
                   className={
                     keyTaken || keyInvalid
                       ? "text-xs text-destructive"
-                      : "text-xs text-muted-foreground"
+                      : "text-xs text-fg-2"
                   }
                 >
                   {keyTaken
@@ -267,6 +267,7 @@ export function McodeProviderForm({
           />
           <OpenCodeFormFields
             apiFormats={API_FORMATS}
+            presetModelSources={mcodePresetModelSources}
             npm={config.api ?? "anthropic-messages"}
             onNpmChange={(api) => update({ ...config, api })}
             apiKey={config.options?.apiKey ?? ""}
@@ -285,23 +286,10 @@ export function McodeProviderForm({
             extraOptions={extraOptions}
             onExtraOptionsChange={(draft) => {
               setExtraOptions(draft);
-              const options = Object.fromEntries(
-                Object.entries(config.options ?? {}).filter(([key]) =>
-                  isKnownOpencodeOptionKey(key),
-                ),
-              );
-              for (const [key, value] of Object.entries(draft)) {
-                if (
-                  !key.trim() ||
-                  key.startsWith(OPENCODE_EXTRA_OPTION_DRAFT_PREFIX)
-                )
-                  continue;
-                try {
-                  options[key.trim()] = JSON.parse(value);
-                } catch {
-                  options[key.trim()] = value;
-                }
-              }
+              const options: OpenCodeProviderOptions = {
+                ...(config.options ?? {}),
+              };
+              mergeOpencodeExtraOptionRows(options, draft);
               update({ ...config, options });
             }}
           />
